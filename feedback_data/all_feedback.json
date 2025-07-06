@@ -1,0 +1,20 @@
+[
+  {
+    "uid": 438,
+    "label": "spam",
+    "timestamp": "2025-07-07T01:16:41.880670",
+    "email": "[Ручная проверка]\n✉️ От: AliExpress <newsletter@aliexpress.com>\n📌 Тема: Вы уже видели наши новые разделы и товары?\n📝 Содержание:"
+  },
+  {
+    "uid": 17075,
+    "label": "spam",
+    "timestamp": "2025-07-07T01:22:37.386259",
+    "email": "🤔 НЕУВЕРЕН [0.50]\n✉️ От: \"tiran4ik ;D\" <arcady.zvetco@gmail.com>\n📌 Тема: спам спам спам\n📝 спам спам спам"
+  },
+  {
+    "uid": 17076,
+    "label": "spam",
+    "timestamp": "2025-07-07T01:28:20.529745",
+    "email": "🤔 НЕУВЕРЕН [0.50]\n✉️ От: \"tiran4ik ;D\" <arcady.zvetco@gmail.com>\n📌 Тема: спам\n📝 спам"
+  }
+]
