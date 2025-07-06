@@ -28,6 +28,8 @@ from telegram.ext import (
     ContextTypes,
     ConversationHandler,
 )
+load_dotenv()
+from ai_filter import analyze_importance
 
 # Logging
 logging.basicConfig(
@@ -40,7 +42,7 @@ logger = logging.getLogger(__name__)
 moscow_tz = timezone('Europe/Moscow')
 
 # Load environment
-load_dotenv()
+
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = int(os.getenv("CHAT_ID", "0"))
 IMAP_USER = os.getenv("IMAP_USER")
@@ -49,7 +51,8 @@ STATE_FILE = 'state.json'
 
 # Default state structure
 DEFAULT_STATE = {
-    "last_uid": 0,
+    "last_uid": 0,              # для realtime + периодики
+    "last_uid_daily": 0,        # для дневного отчёта
     "auto_enabled": True,
     "auto_interval": 30,
     "snooze_until": None,
@@ -68,6 +71,7 @@ if os.path.exists(STATE_FILE):
         for key, value in DEFAULT_STATE.items():
             if key not in state:
                 state[key] = value
+        state.setdefault("last_uid_daily", state["last_uid"])
     except (json.JSONDecodeError, FileNotFoundError):
         state = DEFAULT_STATE.copy()
         logger.warning("State file corrupted, using default state")
@@ -202,6 +206,92 @@ def check_mail():
         return []
 
 
+def fetch_mail_since(since_uid: int):
+    """
+    Возвращает кортеж (emails, max_uid), где:
+      - emails: список dict {'sender', 'subject', 'body'} для всех писем с UID > since_uid
+      - max_uid: максимальный UID из найденных (или since_uid, если писем нет)
+    """
+    try:
+        with IMAPClient('imap.gmail.com', ssl=True) as client:
+            client.login(IMAP_USER, IMAP_PASS)
+            client.select_folder('INBOX')
+
+            # Ищем все UID начиная с since_uid+1
+            uids = client.search(['UID', f'{since_uid+1}:*'])
+            if not uids:
+                return [], since_uid
+
+            # Забираем ENVELOPE и тело
+            resp = client.fetch(uids, ['ENVELOPE', 'BODY.PEEK[]'])
+            max_uid = max(uids)
+
+        emails = []
+        for uid, data in resp.items():
+            env = data.get(b'ENVELOPE')
+            raw_email = data.get(b'BODY[]')
+            if not env or not raw_email:
+                continue
+
+            # Парсим письмо
+            msg = BytesParser(policy=default).parsebytes(raw_email)
+
+            # Отправитель
+            sender = decode_mime_header(msg.get('From', ''))
+
+            # Тема
+            subject = decode_mime_header(msg.get('Subject', ''))
+            if not subject:
+                subject = "(без темы)"
+
+            # Тело
+            body = ""
+            if msg.is_multipart():
+                for part in msg.walk():
+                    ctype = part.get_content_type()
+                    cdisp = str(part.get("Content-Disposition") or "")
+                    if "attachment" in cdisp:
+                        continue
+                    if ctype == "text/plain":
+                        payload = part.get_payload(decode=True)
+                        if payload:
+                            try:
+                                charset = part.get_content_charset() or 'utf-8'
+                                body = payload.decode(charset, errors='replace')
+                            except:
+                                body = payload.decode('utf-8', errors='replace')
+                        break
+            else:
+                payload = msg.get_payload(decode=True)
+                if payload:
+                    try:
+                        charset = msg.get_content_charset() or 'utf-8'
+                        body = payload.decode(charset, errors='replace')
+                    except:
+                        body = payload.decode('utf-8', errors='replace')
+
+            # Чистим от лишних пробелов
+            subject = re.sub(r'\s+', ' ', subject).strip()
+            sender  = re.sub(r'\s+', ' ', sender).strip()
+            body    = re.sub(r'\s+', ' ', body).strip()
+
+            # Ограничиваем длину тела
+            if len(body) > 300:
+                body = body[:300] + "..."
+
+            emails.append({
+                'sender': sender,
+                'subject': subject,
+                'body': body
+            })
+
+        return emails, max_uid
+
+    except Exception as e:
+        logger.error(f"fetch_mail_since error: {e}", exc_info=True)
+        return [], since_uid
+
+
 # Real-time mail checker
 async def realtime_check(context: ContextTypes.DEFAULT_TYPE):
     if not state['realtime']:
@@ -211,20 +301,35 @@ async def realtime_check(context: ContextTypes.DEFAULT_TYPE):
     emails = await asyncio.to_thread(check_mail)
     if emails:
         for email_info in emails:
-            text = (
-                f"🔔 СРОЧНО!\n"
-                f"✉️ От: {email_info['sender']}\n"
-                f"📌 Тема: {email_info['subject']}\n"
-                f"📝 Содержание:\n{email_info['body']}"
-            )
-            try:
+            score = analyze_importance(email_info['body'] or email_info['subject'])
+            if score >= 0.5:
+                text = (
+                    f"🔔 ВАЖНО [{score:.2f}]\n"
+                    f"✉️ От: {email_info['sender']}\n"
+                    f"📌 Тема: {email_info['subject']}\n"
+                    f"📝 {email_info['body']}"
+                )
                 await context.bot.send_message(
                     chat_id=CHAT_ID,
-                    text=text,
-                    reply_markup=ReplyKeyboardMarkup([["/start"]], resize_keyboard=True)
+                    text=text
                 )
-            except Exception as e:
-                logger.error(f"Realtime notify error: {str(e)}")
+
+    # if emails:
+    #     for email_info in emails:
+    #         text = (
+    #             f"🔔 СРОЧНО!\n"
+    #             f"✉️ От: {email_info['sender']}\n"
+    #             f"📌 Тема: {email_info['subject']}\n"
+    #             f"📝 Содержание:\n{email_info['body']}"
+    #         )
+    #         try:
+    #             await context.bot.send_message(
+    #                 chat_id=CHAT_ID,
+    #                 text=text,
+    #                 reply_markup=ReplyKeyboardMarkup([["/start"]], resize_keyboard=True)
+    #             )
+    #         except Exception as e:
+    #             logger.error(f"Realtime notify error: {str(e)}")
 
 
 # Notification routines
@@ -269,31 +374,29 @@ async def notify_periodic(context: ContextTypes.DEFAULT_TYPE):
 # Daily summary at 8:00
 async def daily_report(context: ContextTypes.DEFAULT_TYPE):
     logger.info("Running daily report")
-    emails = await asyncio.to_thread(check_mail)
-    if emails:
-        for email_info in emails:
-            text = (
-                f"✉️ От: {email_info['sender']}\n"
-                f"📌 Тема: {email_info['subject']}\n"
-                f"📝 Содержание:\n{email_info['body']}"
-            )
-            try:
-                await context.bot.send_message(
-                    chat_id=CHAT_ID,
-                    text=f"[Дневной отчет]\n{text}",
-                    reply_markup=ReplyKeyboardMarkup([["/start"]], resize_keyboard=True)
-                )
-            except Exception as e:
-                logger.error(f"Daily report error: {str(e)}")
+    emails, max_uid = await asyncio.to_thread(fetch_mail_since, state["last_uid_daily"])
+    state["last_uid_daily"] = max_uid
+    save_state()
+    non_important = []
+    for email_info in emails:
+        score = analyze_importance(email_info['body'] or email_info['subject'])
+        if score < 0.5:
+            non_important.append(email_info)
+
+    if non_important:
+        report = "\n\n".join(
+            f"✉️ {email_info['subject']} (от {email_info['sender']}) — важность {analyze_importance(email_info['body'] or email_info['subject']):.2f}"
+            for email_info in non_important
+        )
+        await context.bot.send_message(
+            chat_id=CHAT_ID,
+            text=f"[Дневной отчёт] Неважные письма:\n\n{report}"
+        )
     else:
-        try:
-            await context.bot.send_message(
-                chat_id=CHAT_ID,
-                text="[Дневной отчет] Нечего отчитывать",
-                reply_markup=ReplyKeyboardMarkup([["/start"]], resize_keyboard=True)
-            )
-        except Exception as e:
-            logger.error(f"Daily report error: {str(e)}")
+        await context.bot.send_message(
+            chat_id=CHAT_ID,
+            text="[Дневной отчёт] Все письма сегодня были важные или новых не было."
+        )
 
 
 # Handlers
@@ -649,7 +752,8 @@ if __name__ == '__main__':
         realtime_check,
         interval=10,  # seconds
         first=0,
-        name='realtime'
+        name='realtime',
+        job_kwargs = {'max_instances': 3}
     )
 
     # Daily report at 08:00
